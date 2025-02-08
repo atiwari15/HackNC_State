@@ -1,56 +1,130 @@
 import cv2
+import dlib
 import numpy as np
 import time
 from collections import deque
-from gaze_tracking import GazeTracking  # pip install gaze_tracking
 
 # ============================================================
-# Global Variables and Settings
+# Setup: Face Detector, Landmark Predictor, and Constants
 # ============================================================
-# Instantiate the gaze trackinpig object.
-gaze = GazeTracking()
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
-# Video capture setup.
-cap = cv2.VideoCapture(0)
-frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# Eye landmark indices from dlib’s 68-point model.
+LEFT_EYE = [36, 37, 38, 39, 40, 41]
+RIGHT_EYE = [42, 43, 44, 45, 46, 47]
 
-# Calibration variables.
+# Blink detection settings.
+EAR_THRESHOLD = 0.25            # Below this value, eye is considered closed.
+CONSECUTIVE_FRAMES_FOR_BLINK = 2  # Number of consecutive frames for a blink.
+blink_counter = 0
+blink_start_time = None
+blink_detected = False
+
+# Calibration settings.
 calibration_mode = True
 calibration_points = ["top-left", "top-right", "bottom-left", "bottom-right"]
 calibration_index = 0
-calibration_data = []  # Will store raw gaze points (as detected by GazeTracking) for calibration.
+calibration_data = []  # Will store (gaze_ratio_x, gaze_ratio_y) for each calibration point.
 calibration_instructions = "Calibration: Look at the {} corner and press 'c' to capture."
-# These will be computed after calibration:
+
+# Output text (what has been “typed”).
+output_text = ""
+
+# For smoothing: a buffer to store the last few gaze points.
+gaze_buffer = deque(maxlen=5)
+
+# For flashing the selected letter.
+last_selected_cell = None
+last_selected_time = 0
+flash_duration = 0.5  # seconds the cell will flash red.
+
+# Calibration mapping variables (populated after calibration).
 calib_min_x, calib_max_x = 0, 1
 calib_min_y, calib_max_y = 0, 1
 
-# Smoothing: buffer to average gaze points.
-gaze_buffer = deque(maxlen=5)
-
-# Output text (accumulated “typed” letters).
-output_text = ""
-
-# For visual feedback when a letter is selected.
-last_selected_cell = None
-last_selected_time = 0
-flash_duration = 0.5  # seconds
-
 # ============================================================
-# Helper Function: Draw Alphabet Grid Overlay
+# Utility Functions
 # ============================================================
+
+def get_eye_region(eye_points, landmarks):
+    """Return a list of (x,y) coordinates for the specified eye landmarks."""
+    return [(landmarks.part(i).x, landmarks.part(i).y) for i in eye_points]
+
+def get_gaze_ratio(eye_points, landmarks, frame, gray):
+    """
+    Computes the pupil's position ratio within the eye region.
+    Uses color filtering (in HSV) after a Gaussian blur to help with dark colored eyes.
+    """
+    eye_region = np.array(get_eye_region(eye_points, landmarks), dtype=np.int32)
+    mask = np.zeros_like(gray)
+    cv2.fillPoly(mask, [eye_region], 255)
+    
+    # Extract the eye region from the color frame.
+    eye_frame = cv2.bitwise_and(frame, frame, mask=mask)
+    min_x = np.min(eye_region[:, 0])
+    max_x = np.max(eye_region[:, 0])
+    min_y = np.min(eye_region[:, 1])
+    max_y = np.max(eye_region[:, 1])
+    
+    # Crop the eye region.
+    eye_frame = eye_frame[min_y:max_y, min_x:max_x]
+    if eye_frame.size == 0:
+        return 0.5, 0.5  # Fallback if no data.
+    
+    # Apply Gaussian blur to reduce noise.
+    eye_frame_blur = cv2.GaussianBlur(eye_frame, (7, 7), 0)
+    # Convert to HSV color space.
+    hsv_eye = cv2.cvtColor(eye_frame_blur, cv2.COLOR_BGR2HSV)
+    # Use a color filter to isolate dark regions (the pupil).
+    # (HSV range may need fine-tuning for your eye color.)
+    mask_dark = cv2.inRange(hsv_eye, (0, 0, 0), (180, 255, 50))
+    
+    # Find contours in the thresholded image.
+    contours, _ = cv2.findContours(mask_dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        contour = max(contours, key=cv2.contourArea)
+        moments = cv2.moments(contour)
+        if moments['m00'] != 0:
+            cx = int(moments['m10'] / moments['m00'])
+            cy = int(moments['m01'] / moments['m00'])
+        else:
+            cx, cy = eye_frame.shape[1] // 2, eye_frame.shape[0] // 2
+    else:
+        cx, cy = eye_frame.shape[1] // 2, eye_frame.shape[0] // 2
+
+    # Return the relative position (ratio) of the pupil.
+    ratio_x = cx / (eye_frame.shape[1] + 1e-6)
+    ratio_y = cy / (eye_frame.shape[0] + 1e-6)
+    return ratio_x, ratio_y
+
+def compute_EAR(eye_points, landmarks):
+    """Computes the Eye Aspect Ratio (EAR) for blink detection."""
+    p1 = np.array((landmarks.part(eye_points[0]).x, landmarks.part(eye_points[0]).y))
+    p2 = np.array((landmarks.part(eye_points[1]).x, landmarks.part(eye_points[1]).y))
+    p3 = np.array((landmarks.part(eye_points[2]).x, landmarks.part(eye_points[2]).y))
+    p4 = np.array((landmarks.part(eye_points[3]).x, landmarks.part(eye_points[3]).y))
+    p5 = np.array((landmarks.part(eye_points[4]).x, landmarks.part(eye_points[4]).y))
+    p6 = np.array((landmarks.part(eye_points[5]).x, landmarks.part(eye_points[5]).y))
+    
+    A = np.linalg.norm(p2 - p6)
+    B = np.linalg.norm(p3 - p5)
+    C = np.linalg.norm(p1 - p4)
+    ear = (A + B) / (2.0 * C)
+    return ear
+
 def draw_alphabet_grid(frame, output_text, gaze_point=None, last_selected_cell=None, last_selected_time=0, flash_duration=0.5):
     """
-    Overlays an alphabet grid on the provided frame.
-      - The grid uses 3 rows x 9 columns (for A–Z).
-      - If a cell was just selected (via blink), it flashes red.
-      - The current output text is drawn at the bottom in white.
+    Overlays an alphabet grid on the frame.
+    - Each cell contains one letter (A–Z).
+    - If a cell was recently selected (via blink), it flashes red.
+    - The current output text is drawn in white.
     """
     overlay = frame.copy()
     rows, cols = 3, 9
-    fh, fw = frame.shape[:2]
-    cell_width = fw // cols
-    cell_height = fh // rows
+    frame_height, frame_width = frame.shape[:2]
+    cell_width = frame_width // cols
+    cell_height = frame_height // rows
     alphabet = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     letter_index = 0
     current_time = time.time()
@@ -59,13 +133,16 @@ def draw_alphabet_grid(frame, output_text, gaze_point=None, last_selected_cell=N
         for c in range(cols):
             x1, y1 = c * cell_width, r * cell_height
             x2, y2 = x1 + cell_width, y1 + cell_height
-            cell_color = (255, 255, 255)  # white for normal cells
+            
+            # Default cell color and thickness (white).
+            cell_color = (255, 255, 255)
             thickness = 1
             # If this cell was recently selected, flash it red.
             if last_selected_cell is not None and last_selected_cell == (r, c):
                 if current_time - last_selected_time < flash_duration:
-                    cell_color = (0, 0, 255)  # red
+                    cell_color = (0, 0, 255)
                     thickness = 3
+                    
             cv2.rectangle(overlay, (x1, y1), (x2, y2), cell_color, thickness)
             if letter_index < len(alphabet):
                 letter = alphabet[letter_index]
@@ -74,107 +151,120 @@ def draw_alphabet_grid(frame, output_text, gaze_point=None, last_selected_cell=N
                 text_x = x1 + (cell_width - text_size[0]) // 2
                 text_y = y1 + (cell_height + text_size[1]) // 2
                 cv2.putText(overlay, letter, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 2, cell_color, 3)
-    # Draw the current (smoothed) gaze point as a green circle.
+    
+    # Draw the current (smoothed) gaze point in green.
     if gaze_point:
         cv2.circle(overlay, gaze_point, 10, (0, 255, 0), -1)
-    # Draw the output (typed) text at the bottom (in white).
-    cv2.putText(overlay, output_text, (10, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+    # Draw the output (typed) text at the bottom in white.
+    cv2.putText(overlay, output_text, (10, frame_height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
     return overlay
 
-# ============================================================
-# Helper Function: Determine Grid Cell From a Point
-# ============================================================
 def get_cell_from_point(point, frame_shape, rows=3, cols=9):
-    """
-    Given a (x, y) point and the frame dimensions, return (row, col) for the grid cell.
-    """
+    """Return the (row, col) of the grid cell that contains the given point."""
     x, y = point
-    fh, fw = frame_shape[:2]
-    cell_width = fw // cols
-    cell_height = fh // rows
+    frame_height, frame_width = frame_shape[:2]
+    cell_width = frame_width // cols
+    cell_height = frame_height // rows
     col = x // cell_width
     row = y // cell_height
     return (row, col)
 
 # ============================================================
-# Main Loop
+# Main Program Loop
 # ============================================================
+cap = cv2.VideoCapture(0)
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    # Mirror the frame for a natural “self-view.”
+
+    # Mirror the frame for a natural self-view.
     frame = cv2.flip(frame, 1)
-    
-    # Let GazeTracking process the frame.
-    gaze.refresh(frame)
-    annotated_frame = gaze.annotated_frame()  # This frame comes with annotations from the library.
-    
-    # Get raw pupil coordinates.
-    left_pupil = gaze.pupil_left_coords()
-    right_pupil = gaze.pupil_right_coords()
-    # Compute an average “raw gaze point” from the available pupil data.
-    if left_pupil is not None and right_pupil is not None:
-        raw_gaze_point = ((left_pupil[0] + right_pupil[0]) // 2, (left_pupil[1] + right_pupil[1]) // 2)
-    elif left_pupil is not None:
-        raw_gaze_point = left_pupil
-    elif right_pupil is not None:
-        raw_gaze_point = right_pupil
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray)
+
+    if faces:
+        face = faces[0]
+        landmarks = predictor(gray, face)
+        # Get gaze ratios from both eyes using the updated (color-filtered) method.
+        left_ratio = get_gaze_ratio(LEFT_EYE, landmarks, frame, gray)
+        right_ratio = get_gaze_ratio(RIGHT_EYE, landmarks, frame, gray)
+        gaze_ratio_x = (left_ratio[0] + right_ratio[0]) / 2.0
+        gaze_ratio_y = (left_ratio[1] + right_ratio[1]) / 2.0
+
+        # Compute EAR for blink detection.
+        left_ear = compute_EAR(LEFT_EYE, landmarks)
+        right_ear = compute_EAR(RIGHT_EYE, landmarks)
+        avg_ear = (left_ear + right_ear) / 2.0
     else:
-        raw_gaze_point = (frame_width // 2, frame_height // 2)
-    
-    # Smooth the raw gaze point using a moving average.
-    gaze_buffer.append(raw_gaze_point)
-    avg_gaze_x = int(np.mean([pt[0] for pt in gaze_buffer]))
-    avg_gaze_y = int(np.mean([pt[1] for pt in gaze_buffer]))
-    raw_gaze_point_smoothed = (avg_gaze_x, avg_gaze_y)
-    
+        gaze_ratio_x, gaze_ratio_y = 0.5, 0.5
+        avg_ear = 0.3
+
     # ========================================================
-    # Calibration Phase
+    # Calibration Mode: Look at corners and press 'c' to capture calibration data.
     # ========================================================
     if calibration_mode:
         instruction_text = calibration_instructions.format(calibration_points[calibration_index])
-        cv2.putText(annotated_frame, instruction_text, (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-        cv2.imshow("Gaze Tracking", annotated_frame)
+        cv2.putText(frame, instruction_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        cv2.imshow("Accessibility Gaze Typing", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('c'):
-            calibration_data.append(raw_gaze_point_smoothed)
+            calibration_data.append((gaze_ratio_x, gaze_ratio_y))
             calibration_index += 1
             if calibration_index >= len(calibration_points):
-                # Compute min and max from calibration data.
-                xs = [pt[0] for pt in calibration_data]
-                ys = [pt[1] for pt in calibration_data]
+                xs = [d[0] for d in calibration_data]
+                ys = [d[1] for d in calibration_data]
                 calib_min_x = min(xs)
                 calib_max_x = max(xs)
                 calib_min_y = min(ys)
                 calib_max_y = max(ys)
                 calibration_mode = False
-                print("Calibration complete:")
-                print(f"X: {calib_min_x} to {calib_max_x}, Y: {calib_min_y} to {calib_max_y}")
-        continue  # Remain in calibration mode.
-    
+                print("Calibration complete:",
+                      f"X: {calib_min_x:.3f}-{calib_max_x:.3f}, Y: {calib_min_y:.3f}-{calib_max_y:.3f}")
+        continue  # Remain in calibration mode until complete.
+
     # ========================================================
-    # Map the (smoothed) raw gaze point to screen coordinates
-    # using a simple min–max scaling based on calibration.
-    # (If the calibration range is small, the mapping might be more sensitive.)
+    # Map the current gaze using the calibration values.
+    # ========================================================
     if (calib_max_x - calib_min_x) != 0:
-        mapped_x = int((raw_gaze_point_smoothed[0] - calib_min_x) / (calib_max_x - calib_min_x) * frame_width)
+        mapped_x = int((gaze_ratio_x - calib_min_x) / (calib_max_x - calib_min_x) * frame_width)
     else:
-        mapped_x = raw_gaze_point_smoothed[0]
+        mapped_x = int(gaze_ratio_x * frame_width)
     if (calib_max_y - calib_min_y) != 0:
-        mapped_y = int((raw_gaze_point_smoothed[1] - calib_min_y) / (calib_max_y - calib_min_y) * frame_height)
+        mapped_y = int((gaze_ratio_y - calib_min_y) / (calib_max_y - calib_min_y) * frame_height)
     else:
-        mapped_y = raw_gaze_point_smoothed[1]
-    mapped_gaze_point = (np.clip(mapped_x, 0, frame_width - 1),
-                         np.clip(mapped_y, 0, frame_height - 1))
-    
+        mapped_y = int(gaze_ratio_y * frame_height)
+    gaze_point = (np.clip(mapped_x, 0, frame_width - 1), np.clip(mapped_y, 0, frame_height - 1))
+
+    # ------------------------------------------------------------
+    # Smooth the gaze point using a moving average.
+    # ------------------------------------------------------------
+    gaze_buffer.append(gaze_point)
+    avg_gaze_x = int(np.mean([pt[0] for pt in gaze_buffer]))
+    avg_gaze_y = int(np.mean([pt[1] for pt in gaze_buffer]))
+    gaze_point = (avg_gaze_x, avg_gaze_y)
+
     # ========================================================
-    # Blink Detection for Letter Selection
+    # Blink Detection: If a blink is detected, select the letter.
     # ========================================================
-    # Use the library’s blink detection.
-    if gaze.is_blinking():
-        cell = get_cell_from_point(mapped_gaze_point, frame.shape, rows=3, cols=9)
+    if avg_ear < EAR_THRESHOLD:
+        blink_counter += 1
+        if blink_start_time is None:
+            blink_start_time = time.time()
+    else:
+        if blink_counter >= CONSECUTIVE_FRAMES_FOR_BLINK:
+            blink_detected = True
+        else:
+            blink_detected = False
+        blink_counter = 0
+        blink_start_time = None
+
+    if blink_detected:
+        cell = get_cell_from_point(gaze_point, frame.shape, rows=3, cols=9)
         last_selected_cell = cell
         last_selected_time = time.time()
         cell_index = cell[0] * 9 + cell[1]
@@ -183,16 +273,14 @@ while True:
             selected_letter = alphabet[cell_index]
             output_text += selected_letter
             print("Selected Letter:", selected_letter)
-        # To avoid rapid repeat triggering, pause briefly.
-        time.sleep(0.3)
-    
+        blink_detected = False
+
     # ========================================================
-    # Draw the Alphabet Grid Overlay on the Frame
+    # Overlay the alphabet grid (with flashing and white text) on the frame.
     # ========================================================
-    frame_with_grid = draw_alphabet_grid(annotated_frame, output_text, mapped_gaze_point,
-                                         last_selected_cell, last_selected_time, flash_duration)
-    
-    cv2.imshow("Gaze Tracking", frame_with_grid)
+    frame_with_grid = draw_alphabet_grid(frame, output_text, gaze_point, last_selected_cell, last_selected_time, flash_duration)
+    cv2.imshow("Accessibility Gaze Typing", frame_with_grid)
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
